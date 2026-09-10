@@ -68,9 +68,15 @@ unsafe fn set_clipboard_text(hwnd: HWND, text: &str) {
         GlobalUnlock(hmem);
         if OpenClipboard(hwnd) != 0 {
             EmptyClipboard();
-            SetClipboardData(CF_UNICODETEXT, hmem as _);
+            if SetClipboardData(CF_UNICODETEXT, hmem as _).is_null() {
+                GlobalFree(hmem);
+            }
             CloseClipboard();
+        } else {
+            GlobalFree(hmem);
         }
+    } else {
+        GlobalFree(hmem);
     }
 }
 
@@ -89,9 +95,10 @@ unsafe fn open_file_dialog(hwnd: HWND) -> Option<std::path::PathBuf> {
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
 
     if GetOpenFileNameW(&mut ofn) != 0 {
+        use std::os::windows::ffi::OsStringExt;
         let len = file_buf.iter().position(|&c| c == 0).unwrap_or(file_buf.len());
-        let path_str = String::from_utf16_lossy(&file_buf[..len]);
-        Some(std::path::PathBuf::from(path_str))
+        let os_str = std::ffi::OsString::from_wide(&file_buf[..len]);
+        Some(std::path::PathBuf::from(os_str))
     } else {
         None
     }
@@ -225,8 +232,11 @@ impl AppState {
                 let wg_conf = profile.parse_wg_config().ok();
 
                 let client_pubkey_b64 = wg_conf.as_ref().map(|c| {
-                    let secret = StaticSecret::from(c.private_key);
+                    use zeroize::Zeroize;
+                    let mut key_bytes = c.private_key;
+                    let secret = StaticSecret::from(key_bytes);
                     let pubkey = PublicKey::from(&secret);
+                    key_bytes.zeroize();
                     base64::engine::general_purpose::STANDARD.encode(pubkey.as_bytes())
                 }).unwrap_or_else(|| "---".to_string());
                 self.current_pubkey_copy = client_pubkey_b64.clone();
@@ -330,10 +340,14 @@ impl AppState {
     }
 
     unsafe fn update_logs(&mut self) {
-        let logs = self.service.logs.lock().unwrap().clone();
-        if logs.len() != self.last_log_count {
-            self.last_log_count = logs.len();
-            let joined = logs.join("\r\n");
+        let logs_guard = match self.service.logs.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if logs_guard.len() != self.last_log_count {
+            self.last_log_count = logs_guard.len();
+            let joined = logs_guard.join("\r\n");
+            drop(logs_guard);
             set_window_text(self.hwnd_txt_logs, &joined);
             SendMessageW(self.hwnd_txt_logs, EM_SETSEL, joined.len() as usize, joined.len() as isize);
             SendMessageW(self.hwnd_txt_logs, EM_SCROLLCARET, 0, 0);
@@ -680,8 +694,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 let mut buf = [0u16; 1024];
                 let len = DragQueryFileW(hdrop, i, buf.as_mut_ptr(), buf.len() as u32);
                 if len > 0 {
-                    let path_str = String::from_utf16_lossy(&buf[..len as usize]);
-                    let path = std::path::PathBuf::from(path_str);
+                    use std::os::windows::ffi::OsStringExt;
+                    let os_str = std::ffi::OsString::from_wide(&buf[..len as usize]);
+                    let path = std::path::PathBuf::from(os_str);
                     if let Ok(profile) = import_profile(&path) {
                         state.reload_profiles();
                         if let Some(pos) = state.profiles.iter().position(|p| p.client_name == profile.client_name) {
@@ -712,7 +727,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             0
         }
 
+        WM_CLOSE => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                if state.service.is_active() {
+                    state.service.stop();
+                    // Brief wait for background thread to restore routing table
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+            }
+            DestroyWindow(hwnd);
+            0
+        }
+
         WM_DESTROY => {
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.service.stop();
+            }
             KillTimer(hwnd, TIMER_STATS_ID);
             PostQuitMessage(0);
             0
@@ -844,6 +876,12 @@ pub fn run_gui() -> Result<(), String> {
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        // Final safety cleanup: ensure tunnel is stopped and routes restored
+        if app_state.service.is_active() {
+            app_state.service.stop();
+            std::thread::sleep(std::time::Duration::from_millis(300));
         }
 
         // Cleanup

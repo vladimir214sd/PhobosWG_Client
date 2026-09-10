@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "phobos-companion"
-version = "0.1.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.23.1",
  "boringtun",
@@ -486,6 +486,7 @@ dependencies = [
  "tar",
  "windows-sys 0.59.0",
  "wintun",
+ "zeroize",
 ]
 
 [[package]]

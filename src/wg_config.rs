@@ -1,7 +1,9 @@
+use std::fmt;
 use std::net::IpAddr;
 use base64::Engine;
+use zeroize::Zeroize;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WireGuardConfig {
     pub private_key: [u8; 32],
     pub client_ipv4: std::net::Ipv4Addr,
@@ -13,6 +15,32 @@ pub struct WireGuardConfig {
     pub preshared_key: Option<[u8; 32]>,
     pub persistent_keepalive: Option<u16>,
     pub allowed_ips: Vec<String>,
+}
+
+impl fmt::Debug for WireGuardConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WireGuardConfig")
+            .field("private_key", &"[REDACTED]")
+            .field("client_ipv4", &self.client_ipv4)
+            .field("client_ipv4_prefix", &self.client_ipv4_prefix)
+            .field("client_ipv6", &self.client_ipv6)
+            .field("dns_servers", &self.dns_servers)
+            .field("mtu", &self.mtu)
+            .field("peer_public_key", &self.peer_public_key)
+            .field("preshared_key", &self.preshared_key.as_ref().map(|_| "[REDACTED]"))
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .field("allowed_ips", &self.allowed_ips)
+            .finish()
+    }
+}
+
+impl Drop for WireGuardConfig {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+        if let Some(ref mut psk) = self.preshared_key {
+            psk.zeroize();
+        }
+    }
 }
 
 impl WireGuardConfig {
@@ -205,5 +233,21 @@ Endpoint = 127.0.0.1:13255
         assert_eq!(wg.dns_servers.len(), 2);
         assert_eq!(wg.persistent_keepalive, Some(25));
         assert!(wg.preshared_key.is_some());
+    }
+
+    #[test]
+    fn test_debug_redaction() {
+        let conf = r#"
+[Interface]
+PrivateKey = MCKqsOSxkbsMPFY4NwOstrz6LxZCJHVmZHbfpzukK2k=
+Address = 10.8.0.3/32
+[Peer]
+PublicKey = fW0sRjGeNpq2ZM+gSftFitWbEMVP5YItK8Qq2TesyBs=
+PresharedKey = 9ai9fEt+ejoo4DttV3/GnSQU8DLEGZli1fiTS927DGI=
+"#;
+        let wg = WireGuardConfig::parse(conf).unwrap();
+        let debug_str = format!("{:?}", wg);
+        assert!(!debug_str.contains("MCKqsOSxkbs"), "Debug output must not contain raw private key");
+        assert!(debug_str.contains("[REDACTED]"), "Debug output must contain [REDACTED]");
     }
 }

@@ -19,10 +19,24 @@ fn main() {
         ];
 
         let mut rc_found = None;
-        for c in &rc_candidates {
-            if std::path::Path::new(c).exists() {
-                rc_found = Some(*c);
-                break;
+        if let Ok(output) = Command::new("where").arg("rc.exe").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(first_line) = stdout.lines().next() {
+                    let path = first_line.trim();
+                    if std::path::Path::new(path).exists() {
+                        rc_found = Some(path.to_string());
+                    }
+                }
+            }
+        }
+
+        if rc_found.is_none() {
+            for c in &rc_candidates {
+                if std::path::Path::new(c).exists() {
+                    rc_found = Some(c.to_string());
+                    break;
+                }
             }
         }
 

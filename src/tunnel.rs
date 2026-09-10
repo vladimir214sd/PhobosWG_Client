@@ -57,6 +57,8 @@ impl StandaloneTunnel {
         socket.connect(target_addr)
             .map_err(|e| format!("Failed to connect UDP socket to {}: {}", target_addr, e))?;
 
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(250)));
+
         let socket = Arc::new(socket);
 
         // 3. Initialize BoringTun WireGuard engine
@@ -96,7 +98,7 @@ impl StandaloneTunnel {
                 drop(obf_lock);
 
                 let payload = if use_stun {
-                    stun_wrap_data_indication(&obf_buf)
+                    stun_wrap_data_indication(&obf_buf).unwrap_or(obf_buf)
                 } else {
                     obf_buf
                 };
@@ -152,7 +154,7 @@ impl StandaloneTunnel {
                         drop(obf_lock);
 
                         let payload = if use_stun {
-                            stun_wrap_data_indication(&obf_buf)
+                            stun_wrap_data_indication(&obf_buf).unwrap_or(obf_buf)
                         } else {
                             obf_buf
                         };
@@ -180,7 +182,10 @@ impl StandaloneTunnel {
             while running_udp_read.load(Ordering::Relaxed) {
                 let n = match socket_udp_read.recv(&mut udp_buf) {
                     Ok(n) => n,
-                    Err(_) => {
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+                            continue;
+                        }
                         if !running_udp_read.load(Ordering::Relaxed) {
                             break;
                         }
@@ -237,7 +242,7 @@ impl StandaloneTunnel {
                             drop(obf_lock);
 
                             let payload = if use_stun {
-                                stun_wrap_data_indication(&obf_buf)
+                                stun_wrap_data_indication(&obf_buf).unwrap_or(obf_buf)
                             } else {
                                 obf_buf
                             };
@@ -275,7 +280,7 @@ impl StandaloneTunnel {
                             drop(obf_lock);
 
                             let payload = if use_stun {
-                                stun_wrap_data_indication(&obf_buf)
+                                stun_wrap_data_indication(&obf_buf).unwrap_or(obf_buf)
                             } else {
                                 obf_buf
                             };
@@ -353,6 +358,6 @@ impl StandaloneTunnel {
     }
 
     pub fn stop(&self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.running.store(false, Ordering::SeqCst);
     }
 }

@@ -1,6 +1,18 @@
-// Obfuscator implementation matching Phobos / wg-obfuscator
+// Obfuscator implementation matching Phobos / wg-obfuscator protocol.
+//
+// SECURITY NOTICE & THREAT MODEL:
+// This obfuscation layer (CRC8 XOR stream cipher + dummy bytes + STUN masking) is
+// designed EXCLUSIVELY for Deep Packet Inspection (DPI) evasion and traffic fingerprinting
+// circumvention on censorship-heavy networks.
+//
+// It does NOT provide cryptographic confidentiality or message integrity. Cryptographic
+// security, confidentiality, peer authentication, replay protection, and perfect forward
+// secrecy are provided strictly by the inner WireGuard Noise protocol (Curve25519,
+// ChaCha20-Poly1305, BLAKE2s) executed by BoringTun.
 
+use std::fmt;
 use rand::Rng;
+use zeroize::Zeroize;
 use crate::crc8::xor_data;
 
 pub const TYPE_HANDSHAKE: u32 = 1;
@@ -12,11 +24,27 @@ pub const MAX_DUMMY_LENGTH_TOTAL: usize = 1024;
 pub const MAX_DUMMY_LENGTH_HANDSHAKE: usize = 512;
 pub const DEFAULT_MAX_DUMMY: usize = 4;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Obfuscator {
     key: Vec<u8>,
     max_dummy: usize,
     obfuscate_bytes: usize,
+}
+
+impl fmt::Debug for Obfuscator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Obfuscator")
+            .field("key", &"[REDACTED]")
+            .field("max_dummy", &self.max_dummy)
+            .field("obfuscate_bytes", &self.obfuscate_bytes)
+            .finish()
+    }
+}
+
+impl Drop for Obfuscator {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
 }
 
 impl Obfuscator {
@@ -210,5 +238,14 @@ mod tests {
         let ok = obf.decode(&mut packet);
         assert!(ok, "decode must succeed");
         assert_eq!(packet, original, "decoded packet must match original");
+    }
+
+    #[test]
+    fn test_debug_redaction() {
+        let key = b"my-super-secret-key".to_vec();
+        let obf = Obfuscator::new(key, 4, 0);
+        let debug_str = format!("{:?}", obf);
+        assert!(!debug_str.contains("my-super-secret-key"), "Debug output must not contain key");
+        assert!(debug_str.contains("[REDACTED]"), "Debug output must contain [REDACTED]");
     }
 }

@@ -14,33 +14,30 @@ use crate::windows_net::{
 const WINTUN_DLL_BYTES: &[u8] = include_bytes!("../wintun.dll");
 
 /// Ensures wintun.dll is available on the filesystem, extracting the embedded binary if necessary.
+/// Strict verification of bytes is performed to prevent DLL Hijacking (CWE-427 / CWE-426).
 pub fn ensure_wintun_dll() -> Result<PathBuf, String> {
     // 1. Check next to the current running executable
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             let path = exe_dir.join("wintun.dll");
             if path.exists() {
-                return Ok(path);
+                if fs::read(&path).map(|b| b == WINTUN_DLL_BYTES).unwrap_or(false) {
+                    return Ok(path);
+                }
             }
-            // Try extracting next to the executable
+            // Try extracting next to the executable if absent or mismatching
             if fs::write(&path, WINTUN_DLL_BYTES).is_ok() {
                 return Ok(path);
             }
         }
     }
 
-    // 2. Check current working directory
-    let cwd_path = PathBuf::from("wintun.dll");
-    if cwd_path.exists() {
-        return Ok(cwd_path);
-    }
-    if fs::write(&cwd_path, WINTUN_DLL_BYTES).is_ok() {
-        return Ok(cwd_path);
-    }
+    // NOTE: We deliberately DO NOT check current working directory (CWD) to prevent DLL Hijacking!
 
-    // 3. Fallback to system %TEMP% folder
-    let temp_path = std::env::temp_dir().join("phobos_wintun.dll");
-    if !temp_path.exists() || fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0) != WINTUN_DLL_BYTES.len() as u64 {
+    // 2. Fallback to system %TEMP% folder with process-isolated path and strict integrity verification
+    let temp_path = std::env::temp_dir().join(format!("phobos_wintun_{}.dll", std::process::id()));
+    let is_valid = temp_path.exists() && fs::read(&temp_path).map(|b| b == WINTUN_DLL_BYTES).unwrap_or(false);
+    if !is_valid {
         fs::write(&temp_path, WINTUN_DLL_BYTES)
             .map_err(|e| format!("Failed to extract wintun.dll to temp directory: {}", e))?;
     }
@@ -54,6 +51,7 @@ pub struct VpnRouteManager {
     physical_if_index: u32,
     adapter_if_index: u32,
     pub adapter_ip: Ipv4Addr,
+    pub has_ipv6: bool,
     routes_installed: bool,
 }
 
@@ -63,6 +61,7 @@ impl VpnRouteManager {
         physical_if_index: u32,
         adapter_if_index: u32,
         adapter_ip: Ipv4Addr,
+        has_ipv6: bool,
     ) -> Self {
         let gateway_ip = get_best_route_gateway(server_ip).map(|(gw, _)| gw);
 
@@ -72,6 +71,7 @@ impl VpnRouteManager {
             physical_if_index,
             adapter_if_index,
             adapter_ip,
+            has_ipv6,
             routes_installed: false,
         }
     }
@@ -119,6 +119,29 @@ impl VpnRouteManager {
             1,
         ).map_err(|e| format!("Failed to add 128.0.0.0/1 route: {}", e))?;
 
+        // 3. Optional IPv6 default routes (::/1 and 8000::/1) to prevent IPv6 leaks
+        if self.has_ipv6 {
+            println!("    -> VPN маршруты IPv6 ::/1 и 8000::/1 через Wintun (интерфейс #{})", self.adapter_if_index);
+            if let Err(e) = add_ip_route(
+                self.adapter_if_index,
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                1,
+                None,
+                1,
+            ) {
+                eprintln!("[!] Предупреждение: не удалось добавить IPv6 маршрут ::/1: {}", e);
+            }
+            if let Err(e) = add_ip_route(
+                self.adapter_if_index,
+                IpAddr::V6(std::net::Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0)),
+                1,
+                None,
+                1,
+            ) {
+                eprintln!("[!] Предупреждение: не удалось добавить IPv6 маршрут 8000::/1: {}", e);
+            }
+        }
+
         self.routes_installed = true;
         println!("[+] Маршруты успешно установлены. Весь интернет-трафик направлен в туннель.");
         Ok(())
@@ -135,6 +158,11 @@ impl VpnRouteManager {
         let _ = delete_ip_route(self.physical_if_index, IpAddr::V4(self.server_ip), 32, gw_opt);
         let _ = delete_ip_route(self.adapter_if_index, IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1, None);
         let _ = delete_ip_route(self.adapter_if_index, IpAddr::V4(Ipv4Addr::new(128, 0, 0, 0)), 1, None);
+
+        if self.has_ipv6 {
+            let _ = delete_ip_route(self.adapter_if_index, IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 1, None);
+            let _ = delete_ip_route(self.adapter_if_index, IpAddr::V6(std::net::Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 0)), 1, None);
+        }
 
         self.routes_installed = false;
         println!("[+] Маршруты очищены.");
@@ -213,6 +241,7 @@ impl WintunDevice {
             physical_if_index,
             adapter_if_index,
             wg_conf.client_ipv4,
+            wg_conf.client_ipv6.is_some(),
         );
 
         route_manager.install_routes()?;

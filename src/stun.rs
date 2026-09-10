@@ -33,7 +33,10 @@ pub fn stun_message_type(buf: &[u8]) -> Option<u16> {
 }
 
 /// Wraps payload in STUN Data Indication header (24 bytes header prepended)
-pub fn stun_wrap_data_indication(payload: &[u8]) -> Vec<u8> {
+pub fn stun_wrap_data_indication(payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.len() > (u16::MAX as usize) {
+        return None;
+    }
     let mut out = Vec::with_capacity(STUN_DATA_IND_HEADER_SIZE + payload.len());
 
     let mut txid = [0u8; 12];
@@ -55,7 +58,7 @@ pub fn stun_wrap_data_indication(payload: &[u8]) -> Vec<u8> {
 
     // Payload
     out.extend_from_slice(payload);
-    out
+    Some(out)
 }
 
 /// Unwraps a STUN Data Indication packet, returning the inner payload.
@@ -117,7 +120,7 @@ mod tests {
     #[test]
     fn test_stun_wrap_unwrap() {
         let payload = b"wireguard-obfuscated-packet-bytes";
-        let wrapped = stun_wrap_data_indication(payload);
+        let wrapped = stun_wrap_data_indication(payload).expect("must wrap");
         assert_eq!(wrapped.len(), 24 + payload.len());
         assert!(is_stun_packet(&wrapped));
 
@@ -132,5 +135,12 @@ mod tests {
         assert!(is_stun_packet(&req));
         assert_eq!(u16::from_be_bytes([req[0], req[1]]), STUN_BINDING_REQ);
         assert_eq!(u16::from_be_bytes([req[20], req[21]]), STUN_ATTR_FINGERPRINT);
+    }
+
+    #[test]
+    fn test_stun_wrap_bounds_check() {
+        let oversized = vec![0u8; 70000];
+        let wrapped = stun_wrap_data_indication(&oversized);
+        assert!(wrapped.is_none(), "Oversized payload exceeding u16::MAX must return None");
     }
 }

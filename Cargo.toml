@@ -1,6 +1,6 @@
 [package]
 name = "phobos-companion"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2021"
 description = "Lightweight Windows companion proxy for Phobos WireGuard protocol"
 
@@ -13,6 +13,7 @@ boringtun = "0.7.1"
 wintun = "0.5.1"
 base64 = "0.23.1"
 ctrlc = "3.5.2"
+zeroize = { version = "1.8", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -25,6 +26,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Shell",
     "Win32_UI_HiDpi",
+    "Win32_Security_Cryptography",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_LibraryLoader",

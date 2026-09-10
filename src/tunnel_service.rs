@@ -54,13 +54,25 @@ impl TunnelService {
     pub fn log(&self, msg: impl Into<String>) {
         let text = format!("[{}] {}", current_time_str(), msg.into());
         if let Ok(mut logs) = self.logs.lock() {
+            if logs.len() >= 2000 {
+                let drain_count = logs.len() - 1500;
+                logs.drain(0..drain_count);
+            }
             logs.push(text);
         }
     }
 
     pub fn start(&self, profile: PhobosProfile) {
-        // Disconnect existing if any
-        self.stop();
+        // Disconnect existing if any and wait for previous session to terminate
+        if self.is_active() {
+            self.stop();
+            for _ in 0..40 {
+                if !self.is_active() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
 
         self.stop_signal.store(false, Ordering::Relaxed);
         *self.active_profile_name.lock().unwrap() = Some(profile.client_name.clone());
@@ -189,6 +201,7 @@ impl TunnelService {
                 *active_name_arc.lock().unwrap() = None;
                 return;
             }
+            let _ = socket.set_read_timeout(Some(Duration::from_millis(250)));
             let socket = Arc::new(socket);
 
             // 6. BoringTun & Obfuscator
@@ -227,7 +240,7 @@ impl TunnelService {
                     let mut obf_buf = hs_packet.to_vec();
                     obfuscator.lock().unwrap().encode(&mut obf_buf);
                     let payload = if use_stun {
-                        stun_wrap_data_indication(&obf_buf)
+                        stun_wrap_data_indication(&obf_buf).unwrap_or(obf_buf)
                     } else {
                         obf_buf
                     };
@@ -242,8 +255,8 @@ impl TunnelService {
                 let _ = socket.send(&req);
             }
 
-            *status_arc.lock().unwrap() = TunnelStatus::Connected;
-            log_fn("Соединение установлено. Ожидание первого трафика...".to_string());
+            *status_arc.lock().unwrap() = TunnelStatus::Connecting;
+            log_fn("Инициализация туннеля. Ожидание завершения WireGuard Handshake...".to_string());
 
             // Worker 1: TUN -> UDP
             let s_tun = wintun_dev.session.clone();
@@ -273,7 +286,7 @@ impl TunnelService {
                         let mut obf_buf = wg_pkt.to_vec();
                         obf_1.lock().unwrap().encode(&mut obf_buf);
                         let payload = if use_stun {
-                            stun_wrap_data_indication(&obf_buf)
+                            stun_wrap_data_indication(&obf_buf).unwrap_or(obf_buf)
                         } else {
                             obf_buf
                         };
@@ -299,7 +312,10 @@ impl TunnelService {
                 while !stop_2.load(Ordering::Relaxed) {
                     let n = match sock_2.recv(&mut udp_buf) {
                         Ok(n) => n,
-                        Err(_) => {
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+                                continue;
+                            }
                             if stop_2.load(Ordering::Relaxed) {
                                 break;
                             }
@@ -349,7 +365,7 @@ impl TunnelService {
                                 let mut obf_buf = wg_pkt.to_vec();
                                 obf_2.lock().unwrap().encode(&mut obf_buf);
                                 let payload = if use_stun {
-                                    stun_wrap_data_indication(&obf_buf)
+                                    stun_wrap_data_indication(&obf_buf).unwrap_or(obf_buf)
                                 } else {
                                     obf_buf
                                 };
@@ -380,7 +396,7 @@ impl TunnelService {
                             let mut obf_buf = wg_pkt.to_vec();
                             obf_3.lock().unwrap().encode(&mut obf_buf);
                             let payload = if use_stun {
-                                stun_wrap_data_indication(&obf_buf)
+                                stun_wrap_data_indication(&obf_buf).unwrap_or(obf_buf)
                             } else {
                                 obf_buf
                             };
@@ -419,8 +435,11 @@ impl TunnelService {
                 let last_hs_secs = if let Ok(tunn_lock) = tunn.lock() {
                     let (since_hs, _, _, _, _) = tunn_lock.stats();
                     if since_hs.is_some() && !handshake_logged {
-                        log_fn("WireGuard Handshake УСПЕШНО завершён! Трафик полностью зашифрован.".to_string());
+                        log_fn("WireGuard Handshake УСПЕШНО завершён! Соединение установлено, трафик зашифрован.".to_string());
                         handshake_logged = true;
+                        if let Ok(mut status_lock) = status_arc.lock() {
+                            *status_lock = TunnelStatus::Connected;
+                        }
                     }
                     since_hs.map(|d| d.as_secs())
                 } else {
@@ -452,7 +471,7 @@ impl TunnelService {
     }
 
     pub fn stop(&self) {
-        self.stop_signal.store(true, Ordering::Relaxed);
+        self.stop_signal.store(true, Ordering::SeqCst);
     }
 
     pub fn is_active(&self) -> bool {

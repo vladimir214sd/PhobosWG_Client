@@ -4,7 +4,7 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::archive::PhobosProfile;
 use crate::obfuscator::{Obfuscator, TYPE_HANDSHAKE};
@@ -23,13 +23,13 @@ pub struct RelayStats {
 }
 
 pub struct PhobosRelay {
-    profile: PhobosProfile,
+    profile: Arc<PhobosProfile>,
     running: Arc<AtomicBool>,
     pub stats: Arc<RelayStats>,
 }
 
 impl PhobosRelay {
-    pub fn new(profile: PhobosProfile) -> Self {
+    pub fn new(profile: Arc<PhobosProfile>) -> Self {
         Self {
             profile,
             running: Arc::new(AtomicBool::new(false)),
@@ -78,6 +78,9 @@ impl PhobosRelay {
         upstream.connect(target_addr)
             .map_err(|e| format!("Failed to connect upstream socket to {}: {}", target_addr, e))?;
 
+        let _ = listener.set_read_timeout(Some(Duration::from_millis(250)));
+        let _ = upstream.set_read_timeout(Some(Duration::from_millis(250)));
+
         let obfuscator = Obfuscator::new(
             self.profile.key.clone(),
             self.profile.max_dummy,
@@ -106,22 +109,42 @@ impl PhobosRelay {
         // 1. Client Loop: reads from 127.0.0.1 (WireGuard client), encodes, sends to server
         thread::spawn(move || {
             let mut buf = vec![0u8; 65535];
+            let mut last_error_log = Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now);
             while running_client.load(Ordering::Relaxed) {
                 match listener_rx.recv_from(&mut buf) {
                     Ok((n, src)) => {
                         if n < 4 {
                             continue;
                         }
-                        // Update current client endpoint
-                        {
-                            let mut lock = client_addr_c.lock().unwrap();
-                            *lock = Some(src);
-                        }
 
                         let pkt_type = Obfuscator::packet_type(&buf[..n]);
                         if let Some(t) = pkt_type {
                             if !Obfuscator::is_known_packet_type(t) {
                                 continue;
+                            }
+                        } else {
+                            continue;
+                        }
+
+                        // Protect against local relay hijacking (CWE-284):
+                        // Bind to the first valid client endpoint and only allow re-binding
+                        // if a new Handshake is initiated (e.g. client reconnected).
+                        {
+                            let mut lock = client_addr_c.lock().unwrap();
+                            match *lock {
+                                None => {
+                                    *lock = Some(src);
+                                }
+                                Some(current_src) => {
+                                    if current_src != src {
+                                        if pkt_type == Some(TYPE_HANDSHAKE) {
+                                            *lock = Some(src);
+                                        } else {
+                                            // Reject foreign packet from unauthorized local port
+                                            continue;
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -135,7 +158,10 @@ impl PhobosRelay {
                         obf_client.encode(&mut packet);
 
                         let final_packet = if is_stun {
-                            stun_wrap_data_indication(&packet)
+                            match stun_wrap_data_indication(&packet) {
+                                Some(p) => p,
+                                None => packet,
+                            }
                         } else {
                             packet
                         };
@@ -146,8 +172,14 @@ impl PhobosRelay {
                         }
                     }
                     Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+                            continue;
+                        }
                         if running_client.load(Ordering::Relaxed) {
-                            eprintln!("[!] Client recv error: {}", e);
+                            if last_error_log.elapsed() >= Duration::from_secs(3) {
+                                last_error_log = Instant::now();
+                                eprintln!("[!] Client recv error: {}", e);
+                            }
                             thread::sleep(Duration::from_millis(50));
                         }
                     }
@@ -163,6 +195,7 @@ impl PhobosRelay {
 
         thread::spawn(move || {
             let mut buf = vec![0u8; 65535];
+            let mut last_error_log = Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now);
             while running_server.load(Ordering::Relaxed) {
                 match upstream_rx.recv(&mut buf) {
                     Ok(n) => {
@@ -204,10 +237,14 @@ impl PhobosRelay {
                         }
                     }
                     Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+                            continue;
+                        }
                         if running_server.load(Ordering::Relaxed) {
                             let raw = e.raw_os_error();
                             // Error 10054 on Windows is WSAECONNRESET from ICMP port unreachable
-                            if raw != Some(10054) {
+                            if raw != Some(10054) && last_error_log.elapsed() >= Duration::from_secs(3) {
+                                last_error_log = Instant::now();
                                 eprintln!("[!] Server recv error: {}", e);
                             }
                             thread::sleep(Duration::from_millis(20));

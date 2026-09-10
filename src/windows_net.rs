@@ -87,14 +87,161 @@ pub fn get_best_route_gateway(target_ip: Ipv4Addr) -> Option<(Ipv4Addr, u32)> {
     }
 }
 
-/// Checks if current process is running with elevated administrator privileges
+/// Checks if current process is running with elevated administrator privileges (UAC elevated token)
 #[cfg(windows)]
 pub fn is_admin() -> bool {
-    #[link(name = "shell32")]
-    extern "system" {
-        fn IsUserAnAdmin() -> i32;
+    #[repr(C)]
+    struct TokenElevationStruct {
+        token_is_elevated: u32,
     }
-    unsafe { IsUserAnAdmin() != 0 }
+
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION_CLASS: i32 = 20;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn CloseHandle(hObject: isize) -> i32;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process_handle: isize, desired_access: u32, token_handle: *mut isize) -> i32;
+        fn GetTokenInformation(
+            token_handle: isize,
+            token_information_class: i32,
+            token_information: *mut std::ffi::c_void,
+            token_information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
+    }
+
+    unsafe {
+        let mut token_handle: isize = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle) == 0 {
+            return false;
+        }
+
+        let mut elevation = TokenElevationStruct { token_is_elevated: 0 };
+        let mut ret_len = 0u32;
+        let success = GetTokenInformation(
+            token_handle,
+            TOKEN_ELEVATION_CLASS,
+            &mut elevation as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<TokenElevationStruct>() as u32,
+            &mut ret_len,
+        );
+
+        CloseHandle(token_handle);
+        success != 0 && elevation.token_is_elevated != 0
+    }
+}
+
+/// Restricts file access control list (ACL) so only the Owner (current user) and Built-in Administrators
+/// have access, blocking ACE inheritance from parent directories (SDDL: D:P(A;;GA;;;OW)(A;;GA;;;BA))
+#[cfg(windows)]
+pub fn set_file_owner_only_acl<P: AsRef<std::path::Path>>(path: P) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ffi::OsStr;
+
+    const SDDL_REVISION_1: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x00000004;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x80000000;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut std::ffi::c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+
+        fn SetFileSecurityW(
+            lp_file_name: *const u16,
+            security_information: u32,
+            p_security_descriptor: *const std::ffi::c_void,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(h_mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+
+    let sddl: Vec<u16> = OsStr::new("D:P(A;;GA;;;OW)(A;;GA;;;BA)")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let path_wide: Vec<u16> = OsStr::new(path.as_ref().as_os_str())
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut p_sd: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut sd_size = 0u32;
+
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut p_sd,
+            &mut sd_size,
+        ) == 0 {
+            return Err("Failed to convert SDDL string to security descriptor".to_string());
+        }
+
+        let res = SetFileSecurityW(
+            path_wide.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            p_sd,
+        );
+
+        LocalFree(p_sd);
+
+        if res == 0 {
+            return Err(format!("SetFileSecurityW failed with OS error {}", std::io::Error::last_os_error()));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn set_file_owner_only_acl<P: AsRef<std::path::Path>>(_path: P) -> Result<(), String> {
+    Ok(())
+}
+
+
+/// Safely escapes an argument for the Windows command-line (CommandLineToArgvW inverse)
+pub fn escape_windows_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !arg.contains(' ') && !arg.contains('\t') && !arg.contains('\n') && !arg.contains('\r') && !arg.contains('\"') {
+        return arg.to_string();
+    }
+
+    let mut out = String::from("\"");
+    let mut backslashes = 0;
+
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else if c == '\"' {
+            out.push_str(&"\\".repeat(backslashes * 2 + 1));
+            backslashes = 0;
+            out.push('\"');
+        } else {
+            out.push_str(&"\\".repeat(backslashes));
+            backslashes = 0;
+            out.push(c);
+        }
+    }
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('\"');
+    out
 }
 
 /// Relaunches the current executable requesting UAC elevation
@@ -107,13 +254,7 @@ pub fn elevate_and_relaunch() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let exe_wide: Vec<u16> = OsStr::new(&current_exe).encode_wide().chain(std::iter::once(0)).collect();
-    let params_str = args.iter().map(|a| {
-        if a.contains(' ') {
-            format!("\"{}\"", a)
-        } else {
-            a.clone()
-        }
-    }).collect::<Vec<_>>().join(" ");
+    let params_str = args.iter().map(|a| escape_windows_arg(a)).collect::<Vec<_>>().join(" ");
     let params_wide: Vec<u16> = OsStr::new(&params_str).encode_wide().chain(std::iter::once(0)).collect();
     let runas_wide: Vec<u16> = OsStr::new("runas").encode_wide().chain(std::iter::once(0)).collect();
 
@@ -450,6 +591,8 @@ pub fn set_interface_mtu(if_index: u32, mtu: u32) -> Result<(), String> {
             row.interface_index = if_index;
             if GetIpInterfaceEntry(&mut row) == 0 {
                 row.nl_mtu = mtu;
+                row.use_automatic_metric = 0;
+                row.metric = 1; // Highest priority for VPN adapter to suppress DNS and route leaks
                 let _ = SetIpInterfaceEntry(&mut row);
             }
         }
@@ -561,3 +704,37 @@ pub fn set_interface_dns(guid_u128: u128, dns_servers: &[IpAddr]) -> Result<(), 
         Err(format!("SetInterfaceDnsSettings failed with code {}", res))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_windows_arg() {
+        assert_eq!(escape_windows_arg("simple"), "simple");
+        assert_eq!(escape_windows_arg(""), "\"\"");
+        assert_eq!(escape_windows_arg("hello world"), "\"hello world\"");
+        assert_eq!(escape_windows_arg(r#"foo"bar"#), r#""foo\"bar""#);
+        assert_eq!(escape_windows_arg(r#"C:\Path\To\"#), r#"C:\Path\To\"#);
+        assert_eq!(escape_windows_arg(r#"C:\Path With Spaces\"#), r#""C:\Path With Spaces\\""#);
+    }
+
+    #[test]
+    fn test_is_admin_runs_without_panic() {
+        // Must execute cleanly and return boolean without error
+        let admin = is_admin();
+        println!("Process elevated admin status: {}", admin);
+    }
+
+    #[test]
+    fn test_set_file_owner_only_acl() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("phobos_test_acl.tmp");
+        std::fs::write(&test_file, b"secret content").expect("failed to write test file");
+        let res = set_file_owner_only_acl(&test_file);
+        let _ = std::fs::remove_file(&test_file);
+        assert!(res.is_ok(), "set_file_owner_only_acl must succeed on created file");
+    }
+}
+
+

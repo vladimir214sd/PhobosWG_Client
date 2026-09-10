@@ -83,7 +83,7 @@ fn main() {
     let passed_file = raw_args.iter().skip(1).find(|a| !a.starts_with('-')).map(|s| clean_path(s));
 
     if let Some(ref file_path) = passed_file {
-        if file_path.exists() {
+        if file_path.is_file() && profile_store::is_supported_profile_path(file_path) {
             // Import into profile store
             let _ = profile_store::import_profile(file_path);
         }
@@ -95,14 +95,14 @@ fn main() {
         println!("        Phobos WireGuard Companion for Windows (Rust)       ");
         println!("============================================================");
         let path = passed_file.unwrap_or_else(find_or_prompt_package);
-        let mut profile = match PhobosProfile::load_from_file(&path) {
+        let profile = match PhobosProfile::load_from_file(&path) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("[!] Ошибка загрузки: {}", e);
                 return;
             }
         };
-        run_companion_mode(&mut profile);
+        run_companion_mode(profile);
     } else if is_cli_mode {
         println!("============================================================");
         println!("        Phobos WireGuard Client for Windows (Rust)          ");
@@ -219,7 +219,7 @@ fn run_standalone_cli_mode(profile: &PhobosProfile) {
 }
 
 /// Runs companion proxy mode (exports .conf for official WireGuard app)
-fn run_companion_mode(profile: &mut PhobosProfile) {
+fn run_companion_mode(mut profile: PhobosProfile) {
     let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let ready_conf_path = match profile.export_ready_wg_conf(&current_dir) {
         Ok(p) => p,
@@ -242,13 +242,13 @@ fn run_companion_mode(profile: &mut PhobosProfile) {
     println!("ИНСТРУКЦИЯ ПО ПОДКЛЮЧЕНИЮ:");
     println!("  1. Откройте официальную программу 'WireGuard for Windows'");
     println!("  2. Нажмите 'Добавить туннель' (Ctrl+O) и выберите файл:");
-    println!("     {}", ready_conf_path.file_name().unwrap().to_string_lossy());
+    println!("     {}", ready_conf_path.file_name().unwrap_or_default().to_string_lossy());
     println!("  3. Нажмите кнопку 'Подключить' в WireGuard");
     println!("  4. Не закрывайте это окно, пока используете VPN!");
     println!("------------------------------------------------------------");
     println!();
 
-    let relay = Arc::new(PhobosRelay::new(profile.clone()));
+    let relay = Arc::new(PhobosRelay::new(Arc::new(profile)));
     if let Err(e) = relay.start() {
         eprintln!("[!] Не удалось запустить локальный релей: {}", e);
         return;
@@ -289,7 +289,31 @@ fn run_companion_mode(profile: &mut PhobosProfile) {
     }
 
     relay_for_stats.stop();
-    println!("[+] Релей успешно остановлен. До свидания!");
+    println!("[+] Релей успешно остановлен.");
+
+    // Secure cleanup of plain-text WireGuard configuration containing PrivateKey
+    if ready_conf_path.exists() {
+        print!(
+            "\n[?] Удалить временный файл конфигурации WireGuard '{}' для безопасности? [Y/n]: ",
+            ready_conf_path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let _ = io::stdout().flush();
+        let mut ans = String::new();
+        if io::stdin().read_line(&mut ans).is_ok() {
+            let trimmed = ans.trim().to_lowercase();
+            if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" || trimmed == "д" || trimmed == "да" {
+                if let Err(e) = fs::remove_file(&ready_conf_path) {
+                    eprintln!("[!] Не удалось удалить временный файл: {}", e);
+                } else {
+                    println!("[+] Временный файл конфигурации успешно удален.");
+                }
+            } else {
+                println!("[*] Файл сохранён: {}", ready_conf_path.display());
+            }
+        }
+    }
+
+    println!("[+] До свидания!");
 }
 
 fn clean_path(raw: &str) -> PathBuf {
@@ -303,31 +327,34 @@ fn find_or_prompt_package() -> PathBuf {
         let mut tar_files = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                if ext.eq_ignore_ascii_case("gz") || ext.eq_ignore_ascii_case("tgz") {
-                    tar_files.push(path);
-                }
+            if path.is_file() && profile_store::is_supported_profile_path(&path) {
+                tar_files.push(path);
             }
         }
 
         if tar_files.len() == 1 {
-            println!("[*] Обнаружен архив пакета: {}", tar_files[0].display());
+            println!("[*] Обнаружен файл пакета/профиля: {}", tar_files[0].display());
             return tar_files.remove(0);
         }
     }
 
     loop {
-        println!("\nПеретащите файл пакета Phobos (.tar.gz) в это окно и нажмите Enter:");
+        println!("\nПеретащите файл пакета Phobos (.tar.gz, .tgz, .conf) в это окно и нажмите Enter:");
         print!("> ");
         let _ = io::stdout().flush();
 
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_ok() {
             let path = clean_path(&input);
-            if path.exists() {
-                return path;
+            if path.is_file() {
+                if profile_store::is_supported_profile_path(&path) {
+                    return path;
+                } else {
+                    println!("[!] Неподдерживаемый формат файла. Поддерживаются .tar.gz, .tgz, .conf, .enc");
+                    continue;
+                }
             }
-            println!("[!] Файл не найден: {}", path.display());
+            println!("[!] Файл не найден или не является обычным файлом: {}", path.display());
         }
     }
 }
