@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Executables
+*.exe
+
+# Local profile secrets / configs
+*.conf
+*.tar.gz
+*.tgz
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.bak
