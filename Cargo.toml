@@ -1,8 +1,8 @@
 [package]
-name = "phobos-companion"
+name = "phobos-client"
 version = "1.0.1"
 edition = "2021"
-description = "Lightweight Windows companion proxy for Phobos WireGuard protocol"
+description = "Native Windows GUI and CLI client for Phobos WireGuard protocol"
 
 [dependencies]
 flate2 = "1.0"

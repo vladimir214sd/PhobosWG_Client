@@ -474,7 +474,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "phobos-companion"
+name = "phobos-client"
 version = "1.0.1"
 dependencies = [
  "base64 0.23.1",

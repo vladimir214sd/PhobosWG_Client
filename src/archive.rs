@@ -370,7 +370,7 @@ fn rewrite_endpoint_to_loopback(conf: &str, local_port: u16) -> String {
         if in_peer && trimmed.to_lowercase().starts_with("allowedips") {
             // Replace 0.0.0.0/0 with 0.0.0.0/1, 128.0.0.0/1 and ::/0 with ::/1, 8000::/1
             // This routes ALL traffic through WireGuard without triggering the WFP kill-switch
-            // that blocks untunneled UDP traffic to companion proxies.
+            // that blocks untunneled UDP traffic to local proxy relays.
             let new_line = line
                 .replace("0.0.0.0/0", "0.0.0.0/1, 128.0.0.0/1")
                 .replace("::/0", "::/1, 8000::/1");

@@ -31,13 +31,13 @@ use wintun_adapter::WintunDevice;
 
 fn main() {
     let raw_args: Vec<String> = env::args().collect();
-    let is_companion_mode = raw_args.iter().any(|a| a == "--companion" || a == "-c");
+    let is_proxy_mode = raw_args.iter().any(|a| a == "--proxy" || a == "-p");
     let is_cli_mode = raw_args.iter().any(|a| a == "--cli");
     let is_help = raw_args.iter().any(|a| a == "--help" || a == "-h");
 
     // Attach to parent terminal only if user invoked CLI/help flags from a console
     #[cfg(windows)]
-    if is_companion_mode || is_cli_mode || is_help {
+    if is_proxy_mode || is_cli_mode || is_help {
         unsafe {
             windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
         }
@@ -51,14 +51,14 @@ fn main() {
         println!("  phobos-client.exe                - Запуск графического интерфейса (GUI)");
         println!("  phobos-client.exe <файл.tar.gz>  - Импорт профиля и запуск GUI");
         println!("  phobos-client.exe --cli          - Консольный режим самостоятельного туннеля");
-        println!("  phobos-client.exe --companion    - Режим компаньона (прокси для офиц. WireGuard)");
+        println!("  phobos-client.exe --proxy        - Режим локального прокси (релей)");
         println!("  phobos-client.exe --help         - Справка");
         return;
     }
 
     // 1. Check for administrator rights on Windows (required for Wintun virtual network adapter)
     #[cfg(windows)]
-    if !is_companion_mode && !windows_net::is_admin() {
+    if !is_proxy_mode && !windows_net::is_admin() {
         if is_cli_mode {
             println!("============================================================");
             println!("        Phobos WireGuard Client for Windows (Rust)          ");
@@ -90,9 +90,9 @@ fn main() {
     }
 
     // 3. Select mode: GUI (default) or CLI
-    if is_companion_mode {
+    if is_proxy_mode {
         println!("============================================================");
-        println!("        Phobos WireGuard Companion for Windows (Rust)       ");
+        println!("        Phobos WireGuard Proxy for Windows (Rust)           ");
         println!("============================================================");
         let path = passed_file.unwrap_or_else(find_or_prompt_package);
         let profile = match PhobosProfile::load_from_file(&path) {
@@ -102,7 +102,7 @@ fn main() {
                 return;
             }
         };
-        run_companion_mode(profile);
+        run_proxy_mode(profile);
     } else if is_cli_mode {
         println!("============================================================");
         println!("        Phobos WireGuard Client for Windows (Rust)          ");
@@ -218,8 +218,8 @@ fn run_standalone_cli_mode(profile: &PhobosProfile) {
     println!("[+] До свидания!");
 }
 
-/// Runs companion proxy mode (exports .conf for official WireGuard app)
-fn run_companion_mode(mut profile: PhobosProfile) {
+/// Runs local proxy mode (exports .conf for external WireGuard app)
+fn run_proxy_mode(mut profile: PhobosProfile) {
     let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let ready_conf_path = match profile.export_ready_wg_conf(&current_dir) {
         Ok(p) => p,
@@ -240,7 +240,7 @@ fn run_companion_mode(mut profile: PhobosProfile) {
     println!("  -> {}", ready_conf_path.display());
     println!("------------------------------------------------------------");
     println!("ИНСТРУКЦИЯ ПО ПОДКЛЮЧЕНИЮ:");
-    println!("  1. Откройте официальную программу 'WireGuard for Windows'");
+    println!("  1. Откройте программу 'WireGuard for Windows'");
     println!("  2. Нажмите 'Добавить туннель' (Ctrl+O) и выберите файл:");
     println!("     {}", ready_conf_path.file_name().unwrap_or_default().to_string_lossy());
     println!("  3. Нажмите кнопку 'Подключить' в WireGuard");
